@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="แดชบอร์ดปรับท่าเตียง Smartbed พร้อมโหมดจำลองและการเชื่อมต่อ ESP32">
+<title>แผงควบคุมเตียงผู้ป่วย</title>
+<link rel="stylesheet" href="style.css">
+<script src="vendor/mqtt.min.js" defer></script>
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="wrap top-inner">
+    <div class="brand"><span class="brand-icon" aria-hidden="true">✚</span><span>แผงควบคุมเตียงผู้ป่วย</span></div>
+    <span class="mode" id="mode-label">โหมดควบคุมเตียงจริง</span>
+  </div>
+</header>
+<main class="wrap">
+  <div class="intro">
+    <h1>ปรับตำแหน่งเตียง</h1>
+    <p>เชื่อมต่อ ESP32 เพื่อสั่งปรับระดับพนักพิง การเอียง และส่วนขาของเตียง</p>
+  </div>
+  <section class="connection" aria-labelledby="connection-title">
+    <h2 id="connection-title">เชื่อมต่อเตียงจริง</h2>
+    <p id="connection-help">ใช้ MQTT Broker เดียวกับ ESP32 ผ่านช่องทาง WebSocket แบบเข้ารหัส (WSS)</p>
+    <form id="connection-form" autocomplete="off" aria-describedby="connection-help">
+      <label for="broker-url">URL ของ MQTT Broker
+        <input id="broker-url" type="url" placeholder="wss://example.com:8884/mqtt" spellcheck="false" required>
+      </label>
+      <label for="broker-username">ชื่อผู้ใช้ MQTT
+        <input id="broker-username" type="text" spellcheck="false" required>
+      </label>
+      <label for="broker-password">รหัสผ่าน MQTT
+        <input id="broker-password" type="password" autocomplete="new-password" required>
+      </label>
+      <div class="connection-actions">
+        <button type="submit" id="connect" class="adjust raise">เชื่อมต่อ</button>
+        <button type="button" id="disconnect" class="adjust lower" disabled>ตัดการเชื่อมต่อ</button>
+        <button type="button" id="switch-mode" class="adjust lower">เปิดโหมดจำลอง</button>
+      </div>
+    </form>
+    <p id="connection-status" class="connection-status" role="status">ยังไม่ได้เชื่อมต่อเตียงจริง</p>
+  </section>
+  <div class="dashboard">
+    <section class="preview" aria-labelledby="preview-title">
+      <div class="preview-head">
+        <div><h2 id="preview-title">ภาพแสดงตำแหน่งเตียง</h2><p>ทิศทางซ้ายและขวาอ้างอิงจากมุมมองผู้ป่วย</p></div>
+        <button type="button" class="reset" id="reset" disabled>กลับท่านอนราบ</button>
+      </div>
+      <canvas id="bed" class="position-unknown" width="720" height="410" aria-hidden="true"></canvas>
+      <dl class="measurements" aria-label="ตำแหน่งเตียง">
+        <div><dt>พนักพิง</dt><dd id="back-angle">—</dd></div>
+        <div><dt>เอียงตัว</dt><dd id="tilt-angle">—</dd></div>
+        <div><dt id="leg-label">ส่วนขา</dt><dd id="leg-angle">—</dd></div>
+      </dl>
+      <div class="preview-foot">
+        <span class="activity" aria-hidden="true"></span>
+        <p id="activity" role="status">ยังไม่มีข้อมูลตำแหน่งเตียงจริง</p>
+        <span id="remaining" class="remaining"></span>
+      </div>
+      <div class="return-spec" id="return-spec">จะแสดงภาพเมื่อได้รับตำแหน่งล่าสุดจากอุปกรณ์</div>
+    </section>
+    <section class="controls" aria-labelledby="controls-title">
+      <div class="controls-head"><h2 id="controls-title">ปุ่มปรับเตียง</h2><span id="control-step">ปรับครั้งละ 1 ระดับ</span></div>
+      <p id="interlock" class="interlock locked" role="status">เชื่อมต่อเตียงจริงก่อนปรับตำแหน่ง</p>
+      <button type="button" id="take-manual-control" class="adjust raise" hidden>เปลี่ยนเป็นควบคุมด้วยตนเอง</button>
+      <div id="control-list"></div>
+    </section>
+  </div>
+</main>
+</body>
+</html>
