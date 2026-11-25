@@ -1,0 +1,1979 @@
+/*
+ * ESP32 Smart Bed Controller - Enhanced Auto Mode with Side Presets
+ * เพิ่ม: พรีเซตตะแคงซ้าย-ขวา, ระบบอัตโนมัติเรียบง่าย, การปรับสมดุลแรงกด
+ * Version: Enhanced Auto 2.0 - Simple Weight-based Auto Adjustment
+ */
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <HX711_ADC.h>
+
+constexpr bool MQTT_ENABLED = false;  // Dashboard controls this board through USB Serial.
+
+// ใช้ Preferences แทน EEPROM สำหรับ ESP32
+#if defined(ESP32)
+#include <Preferences.h>
+Preferences preferences;
+#else
+#include <EEPROM.h>
+#endif
+
+// === WiFi Configuration ===
+// ⚠️ รหัสผ่านอยู่ในโค้ดและไฟล์นี้ซิงก์ขึ้น OneDrive -> ควรเปลี่ยนรหัส WiFi และ MQTT ใหม่
+//    และย้ายไปไว้ในไฟล์ secrets.h ที่ไม่ถูกแชร์
+const char* WIFI_SSID = "A56_AK";              
+const char* WIFI_PASS = "1212312121";  
+
+// === HiveMQ Cloud Configuration ===
+const char* MQTT_SERVER = "b23de53d8f214b1fbf9ee5c1564df770.s1.eu.hivemq.cloud";
+const int MQTT_PORT = 8883;
+const char* MQTT_USER = "Ak12123";  
+const char* MQTT_PASS = "Ak12345678";  
+const char* CLIENT_ID = "ESP32_SmartBed_Enhanced";
+
+// === MQTT Topics ===
+const char* TOPIC_COMMAND = "smartbed/command";
+const char* TOPIC_STATUS = "smartbed/status";
+const char* TOPIC_SENSOR = "smartbed/sensor";
+const char* TOPIC_LOG = "smartbed/log";
+const char* TOPIC_HEARTBEAT = "smartbed/heartbeat";
+const char* TOPIC_AUTO_ALERT = "smartbed/auto/alert";
+const char* TOPIC_AUTO_ACTION = "smartbed/auto/action";
+
+// === Hardware Pins ===
+#define LED_STATUS 2      
+#define LED_WIFI 4        
+#define LED_MQTT 5        
+#define LED_ARDUINO 18    
+
+// HX711 Pins สำหรับ 3 Load Cell - แก้ไข pin configuration
+#define HX711_BACK_LEFT_DT   13    // หลังซ้าย
+#define HX711_BACK_LEFT_SCK  12
+#define HX711_BACK_RIGHT_DT  14    // หลังขวา  
+#define HX711_BACK_RIGHT_SCK 27    // แก้ไขจาก 15 เป็น 27
+#define HX711_HIP_DT         16    // สะโพก
+#define HX711_HIP_SCK        17
+
+// Arduino Serial communication
+// ⚠️ ฮาร์ดแวร์: TX ของ Arduino Uno เป็น 5V แต่ RX ของ ESP32 รับได้ 3.3V
+//    ต้องต่อผ่าน voltage divider (เช่น 1k/2k) หรือ level shifter ที่ขา GPIO26
+#define ARDUINO_RX 26     
+#define ARDUINO_TX 25     // แก้ไขจาก 27 เป็น 25
+
+// === Objects ===
+WiFiClientSecure wifiClient;
+PubSubClient mqttClient(wifiClient);
+HardwareSerial ArduinoSerial(2);
+
+// HX711 Objects สำหรับ 3 Load Cell
+HX711_ADC LoadCell_BackLeft(HX711_BACK_LEFT_DT, HX711_BACK_LEFT_SCK);
+HX711_ADC LoadCell_BackRight(HX711_BACK_RIGHT_DT, HX711_BACK_RIGHT_SCK);
+HX711_ADC LoadCell_Hip(HX711_HIP_DT, HX711_HIP_SCK);
+
+// === Bed Position Data ===
+struct BedPosition {
+  int back = 0;    // 0-10
+  int side = 5;    // 0-10  
+  int leg = 5;     // 0-10 
+} bedPosition, targetPosition;
+
+// === Sensor Data - 3 Load Cell ===
+struct SensorData {
+  float backLeft = 0.0;   
+  float backRight = 0.0;  
+  float hip = 0.0;        
+} sensors;
+
+// === Load Cell Status ===
+struct LoadCellStatus {
+  bool backLeftReady = false;
+  bool backRightReady = false;
+  bool hipReady = false;
+  unsigned long lastReadTime = 0;
+} loadCellStatus;
+
+// === Enhanced Auto Mode Configuration - เรียบง่าย ===
+struct AutoModeConfig {
+  // ✅ Simplified Auto Thresholds
+  float highPressureThreshold = 25.0;    // ลดลงเพื่อให้ตอบสนองเร็วขึ้น
+  float balanceThreshold = 6.0;          // ลดลงเพื่อการปรับสมดุลที่ละเอียดขึ้น
+  
+  // ✅ Simple Timing Configuration (วินาที) - ปรับได้ง่าย
+  int pressureCheckSeconds = 8;          // จับเวลาแรงกดสูง (วินาที)
+  int balanceCheckSeconds = 12;          // จับเวลาความไม่สมดุล (วินาที)  
+  int hipPressureSeconds = 6;            // จับเวลาแรงกดสะโพก (วินาที)
+  
+  // ✅ Enhanced Side Position Presets
+  bool enableSideCorrection = true;      // เปิดใช้การปรับตะแคง
+  bool restrictBackWhenSide = true;      // จำกัดการยกหลังเมื่อตะแคง
+  
+  bool demoMode = true;
+} autoConfig;
+
+// === Enhanced Auto Mode State ===
+struct AutoModeState {
+  bool enabled = false;
+  bool emergencyMode = false;
+  bool demoRunning = false;
+  
+  // ✅ Simple Pressure Tracking (วินาที)
+  unsigned long backLeftHighStart = 0;   // เริ่มต้นแรงกดหลังซ้ายสูง
+  unsigned long backRightHighStart = 0;  // เริ่มต้นแรงกดหลังขวาสูง
+  unsigned long hipHighStart = 0;        // เริ่มต้นแรงกดสะโพกสูง
+  unsigned long balanceIssueStart = 0;   // เริ่มต้นความไม่สมดุล
+  
+  // ✅ Current Position Tracking
+  String currentPositionName = "FLAT";
+  String currentScenario = "IDLE";
+  
+  // ✅ Alert States
+  bool backLeftAlert = false;
+  bool backRightAlert = false;
+  bool hipAlert = false;
+  bool balanceAlert = false;
+  
+} autoState;
+
+// === System State ===
+String bedStatus = "READY";
+String arduinoStatus = "CHECKING";
+bool systemReady = false;
+bool arduinoConnected = false;
+bool loadCellsReady = false;
+int connectionAttempts = 0;
+int maxConnectionAttempts = 3;
+
+bool justReceivedCommand = false;
+unsigned long lastCommandTime = 0;
+const unsigned long COMMAND_COOLDOWN = 3000; 
+
+// === Arduino Communication ===
+String pendingCommand = "";
+String expectedResponse = "";   // คำตอบที่รออยู่ (เช่น "PONG", "STATUS:", "MOVING")
+bool lastCommandOk = false;
+bool waitingForResponse = false;
+unsigned long lastCommandSent = 0;
+unsigned long lastResponseReceived = 0;
+const unsigned long RESPONSE_TIMEOUT = 3000;  
+const unsigned long PING_INTERVAL = 5000;     
+
+// === Timers ===
+unsigned long lastHeartbeat = 0;
+unsigned long lastSensorUpdate = 0;
+unsigned long lastStatusUpdate = 0;
+unsigned long lastLedUpdate = 0;
+unsigned long lastPingCheck = 0;
+unsigned long systemStartTime = 0;
+
+const unsigned long HEARTBEAT_INTERVAL = 30000;   
+const unsigned long SENSOR_INTERVAL = 1000;       
+const unsigned long STATUS_INTERVAL = 5000;       
+
+// === JSON Buffer ===
+// ✅ ขยายจาก 512 -> 2048 (status มี ~33 ฟิลด์ และข้อความไทยใช้ 3 ไบต์/ตัวอักษร เดิมล้นจน JSON ขาด)
+StaticJsonDocument<2048> jsonDoc;
+char jsonBuffer[2048];
+
+// ส่ง jsonDoc ไป MQTT พร้อมตรวจว่าไม่ล้น (ถ้าล้นจะไม่ส่ง JSON ที่ขาดครึ่งๆ กลางๆ)
+bool publishJson(const char* topic) {
+  if (jsonDoc.overflowed()) {
+    Serial.print("⚠️ JSON overflow, not sent: "); Serial.println(topic);
+    return false;
+  }
+  size_t len = measureJson(jsonDoc);
+  if (len >= sizeof(jsonBuffer)) {
+    Serial.print("⚠️ JSON too large ("); Serial.print(len); Serial.print(" bytes): "); Serial.println(topic);
+    return false;
+  }
+  serializeJson(jsonDoc, jsonBuffer, sizeof(jsonBuffer));
+  return mqttClient.publish(topic, jsonBuffer);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println();
+  Serial.println("╔════════════════════════════════════════╗");
+  Serial.println("║   ESP32 Smart Bed - Enhanced Auto     ║");
+  Serial.println("║  🆕 Side Presets + Simple Auto Mode   ║");
+  Serial.println("║       🤖 Weight-based Auto Adjust     ║");
+  Serial.println("║  ✅ Enhanced Position Control Ready!  ║");
+  Serial.println("╚════════════════════════════════════════╝");
+  
+  systemStartTime = millis();
+  
+  setupHardware();
+  setupLoadCells();
+  setupArduinoSerial();
+  if (MQTT_ENABLED) {
+    connectWiFi();
+    setupMQTT();
+    connectMQTT();
+  }
+  initializeArduinoConnection();
+  initializeEnhancedAutoMode();
+  
+  systemReady = true;
+  Serial.println("\n🚀 Enhanced System Ready!");
+  Serial.println("📱 Dashboard: Open smartbed_dashboard_enhanced.html");
+  Serial.println("🆕 New Presets: LEFT_SIDE, RIGHT_SIDE");
+  Serial.println("🤖 Enhanced Auto: Weight-based position adjustment");
+  Serial.println("⌨️ Commands: t=tare, r=calibrate, i=info, h=help");
+  Serial.println("✅ Simple Auto Config: 8s pressure, 12s balance, 6s hip");
+  Serial.println("─────────────────────────────────────────");
+}
+
+void loop() {
+  if (MQTT_ENABLED) {
+    if (!mqttClient.connected()) {
+      connectMQTT();
+    }
+    mqttClient.loop();
+  }
+  
+  if (Serial.available()) {
+    handleSerialCommands();
+  }
+  
+  handleArduinoSerial();
+  updateLoadCells();
+  
+  if (autoState.enabled) {
+    processEnhancedAutoMode();
+  }
+  
+  unsigned long now = millis();
+  
+  if (now - lastPingCheck >= PING_INTERVAL) {
+    checkArduinoConnection();
+    lastPingCheck = now;
+  }
+  
+  if (now - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+    sendHeartbeat();
+    lastHeartbeat = now;
+  }
+  
+  if (now - lastSensorUpdate >= SENSOR_INTERVAL) {
+    readLoadCellData();
+    sendSensorData();
+    lastSensorUpdate = now;
+  }
+  
+  if (now - lastStatusUpdate >= STATUS_INTERVAL) {
+    if (justReceivedCommand && (now - lastCommandTime < COMMAND_COOLDOWN)) {
+      // ข้ามการส่ง status
+    } else {
+      justReceivedCommand = false; 
+      sendStatus();
+      lastStatusUpdate = now;
+    }
+  }
+  
+  if (now - lastLedUpdate >= 500) {
+    updateLEDs();
+    lastLedUpdate = now;
+  }
+}
+
+// === Setup Functions ===
+void setupHardware() {
+  Serial.println("⚙️ Setting up hardware...");
+  
+  pinMode(LED_STATUS, OUTPUT);
+  pinMode(LED_WIFI, OUTPUT);
+  pinMode(LED_MQTT, OUTPUT);
+  pinMode(LED_ARDUINO, OUTPUT);
+  
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_STATUS, HIGH);
+    digitalWrite(LED_WIFI, HIGH);
+    digitalWrite(LED_MQTT, HIGH);
+    digitalWrite(LED_ARDUINO, HIGH);
+    delay(200);
+    digitalWrite(LED_STATUS, LOW);
+    digitalWrite(LED_WIFI, LOW);
+    digitalWrite(LED_MQTT, LOW);
+    digitalWrite(LED_ARDUINO, LOW);
+    delay(200);
+  }
+  
+  Serial.println("✓ Hardware initialized");
+}
+
+void setupLoadCells() {
+  Serial.println("⚖️ Setting up Load Cells...");
+  
+  LoadCell_BackLeft.begin();
+  LoadCell_BackRight.begin();
+  LoadCell_Hip.begin();
+  
+  unsigned long stabilizingtime = 3000;
+  boolean _tare = true; 
+  
+  Serial.println("⏳ กำลังเริ่มต้น Load Cell ทั้ง 3 ตัว...");
+  Serial.println("📍 Enhanced Pin Mapping:");
+  Serial.print("   หลังซ้าย:  DT="); Serial.print(HX711_BACK_LEFT_DT); Serial.print(", SCK="); Serial.println(HX711_BACK_LEFT_SCK);
+  Serial.print("   หลังขวา:   DT="); Serial.print(HX711_BACK_RIGHT_DT); Serial.print(", SCK="); Serial.print(HX711_BACK_RIGHT_SCK); Serial.println(" ✅");
+  Serial.print("   สะโพก:    DT="); Serial.print(HX711_HIP_DT); Serial.print(", SCK="); Serial.println(HX711_HIP_SCK);
+  Serial.print("   Arduino TX/RX: "); Serial.print(ARDUINO_TX); Serial.print("/"); Serial.print(ARDUINO_RX); Serial.println(" ✅");
+  
+  LoadCell_BackLeft.start(stabilizingtime, _tare);
+  LoadCell_BackRight.start(stabilizingtime, _tare);
+  LoadCell_Hip.start(stabilizingtime, _tare);
+  
+  bool hasTimeout = false;
+  if (LoadCell_BackLeft.getTareTimeoutFlag() || LoadCell_BackLeft.getSignalTimeoutFlag()) {
+    Serial.println("❌ หลังซ้าย: Timeout! ใช้ข้อมูลจำลองแทน");
+    hasTimeout = true;
+  } else {
+    Serial.println("✅ หลังซ้าย: พร้อมใช้งาน");
+    loadCellStatus.backLeftReady = true;
+  }
+  
+  if (LoadCell_BackRight.getTareTimeoutFlag() || LoadCell_BackRight.getSignalTimeoutFlag()) {
+    Serial.println("❌ หลังขวา: Timeout! ใช้ข้อมูลจำลองแทน");
+    hasTimeout = true;
+  } else {
+    Serial.println("✅ หลังขวา: พร้อมใช้งาน");
+    loadCellStatus.backRightReady = true;
+  }
+  
+  if (LoadCell_Hip.getTareTimeoutFlag() || LoadCell_Hip.getSignalTimeoutFlag()) {
+    Serial.println("❌ สะโพก: Timeout! ใช้ข้อมูลจำลองแทน");
+    hasTimeout = true;
+  } else {
+    Serial.println("✅ สะโพก: พร้อมใช้งาน");
+    loadCellStatus.hipReady = true;
+  }
+  
+  if (hasTimeout) {
+    Serial.println("⚠️ บาง Load Cell ไม่พร้อม - ใช้ข้อมูลจำลองสำหรับ Demo");
+    loadCellsReady = false;
+  } else {
+    Serial.println("🎉 Load Cell ทั้ง 3 ตัวพร้อมใช้งาน!");
+    loadCellsReady = true;
+  }
+  
+  loadCalibrationFromStorage();
+  
+  // ✅ รอข้อมูลแรกจากตัวที่พร้อมเท่านั้น และมี timeout 2 วินาที (เดิมอาจค้างตลอดถ้าไม่มี HX711 ต่ออยู่)
+  if (loadCellStatus.backLeftReady || loadCellStatus.backRightReady || loadCellStatus.hipReady) {
+    unsigned long waitStart = millis();
+    while (millis() - waitStart < 2000) {
+      bool gotData = false;
+      if (loadCellStatus.backLeftReady && LoadCell_BackLeft.update()) gotData = true;
+      if (loadCellStatus.backRightReady && LoadCell_BackRight.update()) gotData = true;
+      if (loadCellStatus.hipReady && LoadCell_Hip.update()) gotData = true;
+      if (gotData) break;
+      delay(10);
+    }
+  }
+  
+  Serial.println("✓ Load Cell setup เสร็จสิ้น");
+}
+
+void setupArduinoSerial() {
+  Serial.println("🔗 Setting up Arduino communication...");
+  Serial.print("Using pins: TX="); Serial.print(ARDUINO_TX); Serial.print(", RX="); Serial.println(ARDUINO_RX);
+  
+  ArduinoSerial.begin(115200, SERIAL_8N1, ARDUINO_RX, ARDUINO_TX);
+  delay(1000);
+  clearArduinoBuffer();
+  Serial.println("✓ Arduino Serial initialized");
+}
+
+void connectWiFi() {
+  Serial.println("📶 Connecting to WiFi...");
+  Serial.print("SSID: "); Serial.println(WIFI_SSID);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    digitalWrite(LED_WIFI, !digitalRead(LED_WIFI));
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(LED_WIFI, HIGH);
+    Serial.println();
+    Serial.println("✓ WiFi Connected!");
+    Serial.print("IP Address: "); Serial.println(WiFi.localIP());
+    Serial.print("Signal Strength: "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
+  } else {
+    digitalWrite(LED_WIFI, LOW);
+    Serial.println();
+    Serial.println("❌ WiFi Connection Failed!");
+  }
+}
+
+void setupMQTT() {
+  Serial.println("📡 Setting up MQTT...");
+  // ⚠️ TODO: ใส่ root CA ของ HiveMQ ด้วย wifiClient.setCACert(...) แทน setInsecure()
+  //    ตอนนี้ไม่ตรวจใบรับรอง เสี่ยงโดนดักกลางทาง
+  wifiClient.setInsecure();
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(2048);
+  Serial.println("✓ MQTT configured");
+}
+
+void connectMQTT() {
+  // ✅ ลองใหม่ทุก 5 วินาทีแบบไม่บล็อก (เดิม delay(5000) ทำให้ไม่ได้อ่านข้อความ EMERGENCY จาก Arduino)
+  static unsigned long lastAttempt = 0;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (mqttClient.connected()) return;
+  if (lastAttempt != 0 && millis() - lastAttempt < 5000) return;
+  lastAttempt = millis();
+
+  if (!mqttClient.connected()) {
+    Serial.print("🔗 Connecting to HiveMQ Cloud...");
+    
+    if (mqttClient.connect(CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+      digitalWrite(LED_MQTT, HIGH);
+      Serial.println(" ✓ Connected!");
+      
+      mqttClient.subscribe(TOPIC_COMMAND);
+      Serial.print("📥 Subscribed to: "); Serial.println(TOPIC_COMMAND);
+      
+      sendLog("ESP32 Enhanced Auto Mode connected - Side Presets Ready");
+      delay(100);
+      sendStatus();
+      
+    } else {
+      digitalWrite(LED_MQTT, LOW);
+      Serial.print(" ❌ Failed! Error code: "); Serial.println(mqttClient.state());
+    }
+  }
+}
+
+// === Load Cell Functions ===
+void updateLoadCells() {
+  if (loadCellStatus.backLeftReady) LoadCell_BackLeft.update();
+  if (loadCellStatus.backRightReady) LoadCell_BackRight.update();
+  if (loadCellStatus.hipReady) LoadCell_Hip.update();
+}
+
+void readLoadCellData() {
+  // ✅ ระหว่าง Demo ให้ใช้ค่าที่ Demo ตั้งไว้ ไม่อ่านทับ
+  if (!autoState.demoRunning) {
+    // ✅ ถ้ามีตัวไหนไม่พร้อม จำลองค่าทั้งหมดก่อน แล้วค่อยเขียนทับด้วยค่าจริงของตัวที่พร้อม
+    //    (เดิม: ถ้าหลังซ้ายพร้อมแต่หลังขวาเสีย หลังขวาจะเป็น 0 ตลอด -> balance alert ค้าง)
+    if (!loadCellStatus.backLeftReady || !loadCellStatus.backRightReady || !loadCellStatus.hipReady) {
+      simulateLoadCellData();
+    }
+    if (loadCellStatus.backLeftReady) {
+      sensors.backLeft = max(0.0f, LoadCell_BackLeft.getData() / 1000.0f);
+    }
+    if (loadCellStatus.backRightReady) {
+      sensors.backRight = max(0.0f, LoadCell_BackRight.getData() / 1000.0f);
+    }
+    if (loadCellStatus.hipReady) {
+      sensors.hip = max(0.0f, LoadCell_Hip.getData() / 1000.0f);
+    }
+  }
+
+  loadCellStatus.lastReadTime = millis();
+  
+  static unsigned long lastDebugPrint = 0;
+  if (millis() - lastDebugPrint > 10000) {
+    Serial.print("📊 Load Cell: หลังซ้าย="); Serial.print(sensors.backLeft, 1);
+    Serial.print("kg, หลังขวา="); Serial.print(sensors.backRight, 1);
+    Serial.print("kg, สะโพก="); Serial.print(sensors.hip, 1); Serial.println("kg");
+    
+    if (autoState.enabled) {
+      Serial.print("🤖 Enhanced Auto: "); Serial.print(autoState.enabled ? "ON" : "OFF");
+      Serial.print(", Position: "); Serial.print(autoState.currentPositionName.c_str());
+      Serial.print(", Scenario: "); Serial.println(autoState.currentScenario.c_str());
+    }
+    lastDebugPrint = millis();
+  }
+}
+
+void simulateLoadCellData() {
+  // ✅ Enhanced simulation with side position effects
+  float baseBack = 12.0 + (bedPosition.back * 2.5);
+  float baseLeg = 15.0 + (bedPosition.leg * 3.0);
+  float baseHip = 20.0 - (bedPosition.leg * 1.0);
+  
+  // ✅ Apply side position effects
+  float sideEffect = 0.0;
+  if (bedPosition.side < 3) {      // Left side
+    sideEffect = (3 - bedPosition.side) * 3.0;  // เพิ่มแรงกดซ้าย
+  } else if (bedPosition.side > 7) { // Right side  
+    sideEffect = -(bedPosition.side - 7) * 3.0; // เพิ่มแรงกดขวา
+  }
+  
+  // ✅ จำลองทุกครั้ง (เดิมเช็ค scenario == IDLE ทำให้ค่าค้างถาวรหลังเกิด alert ครั้งแรก)
+  sensors.backLeft = baseBack + random(-30, 100) / 10.0 + sideEffect;
+  sensors.backRight = baseBack + random(-30, 100) / 10.0 - sideEffect;
+  sensors.hip = baseHip + random(-50, 150) / 10.0;
+
+  sensors.backLeft = max(0.0f, sensors.backLeft);
+  sensors.backRight = max(0.0f, sensors.backRight);
+  sensors.hip = max(0.0f, sensors.hip);
+}
+
+void loadCalibrationFromStorage() {
+  Serial.println("📖 Loading calibration from storage...");
+  
+  // ✅ ค่า Calibration ที่ได้จากโค้ด calibration
+  float calBackLeft = 100.0;    
+  float calBackRight = 100.0;   
+  float calHip = -110.0;         
+  
+  if (calBackLeft == -1000.0 || calBackRight == -1000.0 || calHip == -1000.0) {
+#if defined(ESP32)
+    preferences.begin("smartbed", true);
+    
+    if (calBackLeft == -1000.0) {
+      calBackLeft = preferences.getFloat("cal_left", 1.0);
+    }
+    if (calBackRight == -1000.0) {
+      calBackRight = preferences.getFloat("cal_right", 1.0);
+    }
+    if (calHip == -1000.0) {
+      calHip = preferences.getFloat("cal_hip", 1.0);
+    }
+    
+    preferences.end();
+#endif
+  }
+  
+  // ตั้งค่า calibration
+  if (loadCellStatus.backLeftReady) {
+    LoadCell_BackLeft.setCalFactor(calBackLeft);
+    Serial.print("✅ หลังซ้าย: Calibration = "); Serial.println(calBackLeft, 2);
+  }
+  
+  if (loadCellStatus.backRightReady) {
+    LoadCell_BackRight.setCalFactor(calBackRight);
+    Serial.print("✅ หลังขวา: Calibration = "); Serial.println(calBackRight, 2);
+  }
+  
+  if (loadCellStatus.hipReady) {
+    LoadCell_Hip.setCalFactor(calHip);
+    Serial.print("✅ สะโพก: Calibration = "); Serial.println(calHip, 2);
+  }
+  
+  if (calBackLeft == 1.0 || calBackRight == 1.0 || calHip == 1.0) {
+    Serial.println("💡 ใช้โค้ด Load Cell Test เพื่อหาค่า calibration");
+  }
+}
+
+void saveCalibrationToStorage(int cellNumber, float value) {
+  String cellName, key;
+  
+  switch (cellNumber) {
+    case 1: cellName = "หลังซ้าย"; key = "cal_left"; break;
+    case 2: cellName = "หลังขวา"; key = "cal_right"; break;
+    case 3: cellName = "สะโพก"; key = "cal_hip"; break;
+    default: return;
+  }
+  
+#if defined(ESP32)
+  preferences.begin("smartbed", false);
+  preferences.putFloat(key.c_str(), value);
+  preferences.end();
+#endif
+  
+  Serial.print("✅ บันทึกค่า "); Serial.print(value, 2); Serial.print(" สำหรับ "); Serial.print(cellName); Serial.println(" แล้ว");
+}
+
+void tareAllLoadCells() {
+  Serial.println("📏 กำลัง Tare Load Cell ทั้ง 3 ตัว...");
+  
+  if (loadCellStatus.backLeftReady) LoadCell_BackLeft.tareNoDelay();
+  if (loadCellStatus.backRightReady) LoadCell_BackRight.tareNoDelay();
+  if (loadCellStatus.hipReady) LoadCell_Hip.tareNoDelay();
+  
+  bool allTareComplete = false;
+  unsigned long tareStartTime = millis();
+  
+  while (!allTareComplete && (millis() - tareStartTime < 5000)) {
+    bool backLeftDone = !loadCellStatus.backLeftReady || LoadCell_BackLeft.getTareStatus();
+    bool backRightDone = !loadCellStatus.backRightReady || LoadCell_BackRight.getTareStatus();
+    bool hipDone = !loadCellStatus.hipReady || LoadCell_Hip.getTareStatus();
+    
+    allTareComplete = backLeftDone && backRightDone && hipDone;
+    updateLoadCells();
+    delay(10);
+  }
+  
+  if (allTareComplete) {
+    Serial.println("✅ Tare เสร็จสิ้นทั้ง 3 ตัว");
+    sendLog("Load Cell tare completed");
+  } else {
+    Serial.println("⚠️ Tare timeout บาง Load Cell");
+    sendLog("Load Cell tare timeout");
+  }
+}
+
+// === Enhanced Auto Mode Functions ===
+void initializeEnhancedAutoMode() {
+  Serial.println("🤖 Initializing Enhanced Auto Mode...");
+  
+  autoState.currentPositionName = "FLAT";
+  autoState.currentScenario = "IDLE";
+  
+  // รีเซ็ตตัวจับเวลา
+  autoState.backLeftHighStart = 0;
+  autoState.backRightHighStart = 0;
+  autoState.hipHighStart = 0;
+  autoState.balanceIssueStart = 0;
+  
+  Serial.println("✅ Enhanced Auto Configuration:");
+  Serial.print("   - Pressure Check: "); Serial.print(autoConfig.pressureCheckSeconds); Serial.println(" วินาที");
+  Serial.print("   - Balance Check: "); Serial.print(autoConfig.balanceCheckSeconds); Serial.println(" วินาที");
+  Serial.print("   - Hip Pressure: "); Serial.print(autoConfig.hipPressureSeconds); Serial.println(" วินาที");
+  Serial.print("   - High Pressure Threshold: "); Serial.print(autoConfig.highPressureThreshold); Serial.println(" kg");
+  Serial.print("   - Balance Threshold: "); Serial.print(autoConfig.balanceThreshold); Serial.println(" kg");
+  Serial.println("✓ Enhanced Auto Mode initialized");
+}
+
+void processEnhancedAutoMode() {
+  unsigned long now = millis();
+
+  // ✅ ไม่สั่งงานซ้อนขณะเตียงกำลังขยับ หรืออยู่ในโหมดฉุกเฉิน
+  if (bedStatus == "MOVING" || bedStatus == "EMERGENCY") return;
+
+  // ✅ Enhanced Simple Weight-based Auto Logic
+  checkBackLeftPressure(now);
+  checkBackRightPressure(now);
+  checkHipPressure(now);
+  checkBalanceIssue(now);
+  
+  if (autoState.demoRunning) {
+    processEnhancedDemo();
+  }
+}
+
+// ✅ Enhanced Individual Pressure Checks
+void checkBackLeftPressure(unsigned long now) {
+  bool isHighPressure = (sensors.backLeft > autoConfig.highPressureThreshold);
+  
+  if (isHighPressure) {
+    if (autoState.backLeftHighStart == 0) {
+      autoState.backLeftHighStart = now;
+      Serial.print("⏱️ หลังซ้ายแรงกดสูง: "); Serial.print(sensors.backLeft, 1); Serial.println("kg - เริ่มจับเวลา");
+    }
+    
+    unsigned long duration = (now - autoState.backLeftHighStart) / 1000;
+    if (duration >= autoConfig.pressureCheckSeconds && !autoState.backLeftAlert) {
+      autoState.backLeftAlert = true;
+      autoState.currentScenario = "BACK_LEFT_PRESSURE";
+      
+      String alertMsg = "หลังซ้ายแรงกดสูง " + String(duration) + " วินาที: " + String(sensors.backLeft, 1) + "kg";
+      sendAutoAlert("BACK_LEFT_PRESSURE", alertMsg, "WARNING");
+      
+      handleBackLeftPressureRelief();
+    }
+  } else {
+    autoState.backLeftHighStart = 0;
+    autoState.backLeftAlert = false;
+  }
+}
+
+void checkBackRightPressure(unsigned long now) {
+  bool isHighPressure = (sensors.backRight > autoConfig.highPressureThreshold);
+  
+  if (isHighPressure) {
+    if (autoState.backRightHighStart == 0) {
+      autoState.backRightHighStart = now;
+      Serial.print("⏱️ หลังขวาแรงกดสูง: "); Serial.print(sensors.backRight, 1); Serial.println("kg - เริ่มจับเวลา");
+    }
+    
+    unsigned long duration = (now - autoState.backRightHighStart) / 1000;
+    if (duration >= autoConfig.pressureCheckSeconds && !autoState.backRightAlert) {
+      autoState.backRightAlert = true;
+      autoState.currentScenario = "BACK_RIGHT_PRESSURE";
+      
+      String alertMsg = "หลังขวาแรงกดสูง " + String(duration) + " วินาที: " + String(sensors.backRight, 1) + "kg";
+      sendAutoAlert("BACK_RIGHT_PRESSURE", alertMsg, "WARNING");
+      
+      handleBackRightPressureRelief();
+    }
+  } else {
+    autoState.backRightHighStart = 0;
+    autoState.backRightAlert = false;
+  }
+}
+
+void checkHipPressure(unsigned long now) {
+  bool isHighPressure = (sensors.hip > autoConfig.highPressureThreshold);
+  
+  if (isHighPressure) {
+    if (autoState.hipHighStart == 0) {
+      autoState.hipHighStart = now;
+      Serial.print("⏱️ สะโพกแรงกดสูง: "); Serial.print(sensors.hip, 1); Serial.println("kg - เริ่มจับเวลา");
+    }
+    
+    unsigned long duration = (now - autoState.hipHighStart) / 1000;
+    if (duration >= autoConfig.hipPressureSeconds && !autoState.hipAlert) {
+      autoState.hipAlert = true;
+      autoState.currentScenario = "HIP_PRESSURE";
+      
+      String alertMsg = "สะโพกแรงกดสูง " + String(duration) + " วินาที: " + String(sensors.hip, 1) + "kg";
+      sendAutoAlert("HIP_PRESSURE", alertMsg, "WARNING");
+      
+      handleHipPressureRelief();
+    }
+  } else {
+    autoState.hipHighStart = 0;
+    autoState.hipAlert = false;
+  }
+}
+
+void checkBalanceIssue(unsigned long now) {
+  float balanceDiff = abs(sensors.backLeft - sensors.backRight);
+  bool hasBalanceIssue = (balanceDiff > autoConfig.balanceThreshold);
+  
+  if (hasBalanceIssue) {
+    if (autoState.balanceIssueStart == 0) {
+      autoState.balanceIssueStart = now;
+      Serial.print("⏱️ ความไม่สมดุล: "); Serial.print(balanceDiff, 1); Serial.println("kg - เริ่มจับเวลา");
+    }
+    
+    unsigned long duration = (now - autoState.balanceIssueStart) / 1000;
+    if (duration >= autoConfig.balanceCheckSeconds && !autoState.balanceAlert) {
+      autoState.balanceAlert = true;
+      autoState.currentScenario = "BALANCE_CORRECTION";
+      
+      String alertMsg = "ความไม่สมดุล " + String(duration) + " วินาที: " + String(balanceDiff, 1) + "kg";
+      sendAutoAlert("BALANCE_ISSUE", alertMsg, "WARNING");
+      
+      handleEnhancedBalanceCorrection(balanceDiff);
+    }
+  } else {
+    autoState.balanceIssueStart = 0;
+    autoState.balanceAlert = false;
+  }
+}
+
+// ✅ Enhanced Pressure Relief Functions
+// ✅ ระดับหลังที่ปลอดภัยเมื่อตะแคง: ลดลงได้ไม่เกิน MAX_BACK_WHEN_SIDE แต่ไม่สั่งยกขึ้น
+//    (เดิมสั่ง back=0 ทันที แม้ผู้ป่วยกำลังนั่งอยู่ที่ back=7)
+const int MAX_BACK_WHEN_SIDE = 2;
+int safeBackForSideTilt() {
+  if (autoConfig.restrictBackWhenSide) return min(bedPosition.back, MAX_BACK_WHEN_SIDE);
+  return bedPosition.back;
+}
+
+// ⚠️ ทิศทาง: ตามโมเดลใน simulateLoadCellData() side<5 (ตะแคงซ้าย) = แรงกดฝั่งซ้าย "เพิ่ม"
+//    ดังนั้นลดแรงกดฝั่งซ้ายต้องตะแคงไปขวา และกลับกัน  -> ต้องทดสอบกับกลไกเตียงจริงอีกครั้ง
+void handleBackLeftPressureRelief() {
+  Serial.println("🔄 หลังซ้ายแรงกดสูง -> ตะแคงไปขวา (ถ่ายน้ำหนักออกจากฝั่งซ้าย)");
+
+  int newBack = safeBackForSideTilt();
+  int newSide = 9;                 // ตะแคงขวา
+  int newLeg = bedPosition.leg;    // คงขาไว้
+
+  sendAutoAction("PRESSURE_RELIEF", "RIGHT_SIDE_TILT", newBack, newSide, newLeg);
+  executeEnhancedPositionChange(newBack, newSide, newLeg, "Auto: ตะแคงขวา (แรงกดหลังซ้าย)", "RIGHT_SIDE");
+}
+
+void handleBackRightPressureRelief() {
+  Serial.println("🔄 หลังขวาแรงกดสูง -> ตะแคงไปซ้าย (ถ่ายน้ำหนักออกจากฝั่งขวา)");
+
+  int newBack = safeBackForSideTilt();
+  int newSide = 1;                 // ตะแคงซ้าย
+  int newLeg = bedPosition.leg;
+
+  sendAutoAction("PRESSURE_RELIEF", "LEFT_SIDE_TILT", newBack, newSide, newLeg);
+  executeEnhancedPositionChange(newBack, newSide, newLeg, "Auto: ตะแคงซ้าย (แรงกดหลังขวา)", "LEFT_SIDE");
+}
+
+void handleHipPressureRelief() {
+  Serial.println("🔄 สะโพกแรงกดสูง -> ยกขาขึ้น");
+  
+  // ยกขาขึ้นเพื่อลดแรงกดสะโพก
+  int newBack = bedPosition.back;
+  int newSide = 5;  // กลับสู่กลาง
+  int newLeg = min(10, bedPosition.leg + 2);
+  
+  sendAutoAction("PRESSURE_RELIEF", "LEG_ELEVATION", newBack, newSide, newLeg);
+  executeEnhancedPositionChange(newBack, newSide, newLeg, "Auto: ยกขาขึ้น (แรงกดสะโพก)", "HIP_RELIEF");
+}
+
+void handleEnhancedBalanceCorrection(float balanceDiff) {
+  Serial.print("🔄 ปรับสมดุล: "); Serial.print(balanceDiff, 1); Serial.println("kg");
+  
+  int newBack = bedPosition.back;
+  int newSide = bedPosition.side;
+  int newLeg = bedPosition.leg;
+  
+  if (sensors.backLeft > sensors.backRight) {
+    // ซ้ายหนักกว่า -> เอียงไปขวาเพื่อถ่ายน้ำหนัก (เดิมเอียงซ้าย ซึ่งยิ่งเพิ่มความไม่สมดุล)
+    newSide = min(10, bedPosition.side + 2);
+    sendAutoAction("BALANCE_CORRECTION", "TILT_RIGHT", newBack, newSide, newLeg);
+    executeEnhancedPositionChange(newBack, newSide, newLeg, "Auto: ปรับสมดุล (เอียงขวา)", "BALANCE_RIGHT");
+  } else {
+    // ขวาหนักกว่า -> เอียงไปซ้าย
+    newSide = max(0, bedPosition.side - 2);
+    sendAutoAction("BALANCE_CORRECTION", "TILT_LEFT", newBack, newSide, newLeg);
+    executeEnhancedPositionChange(newBack, newSide, newLeg, "Auto: ปรับสมดุล (เอียงซ้าย)", "BALANCE_LEFT");
+  }
+}
+
+void processEnhancedDemo() {
+  static unsigned long lastDemoChange = 0;
+  static int demoStep = 0;
+  
+  // ✅ แต่ละขั้นต้องค้างนานกว่าเกณฑ์เวลาของ Auto (เดิมค้างแค่ 5 วินาที ไม่ถึง 6/8/12 วินาที -> ไม่เคยสั่งเตียง)
+  unsigned long holdSeconds = max(max(autoConfig.pressureCheckSeconds, autoConfig.balanceCheckSeconds),
+                                  autoConfig.hipPressureSeconds) + 3;
+  if (lastDemoChange != 0 && millis() - lastDemoChange < holdSeconds * 1000UL) return;
+  
+  switch (demoStep) {
+    case 0: startEnhancedPressureDemo(); break;
+    case 1: startEnhancedBalanceDemo(); break;
+    case 2: startEnhancedHipDemo(); break;
+    case 3: resetToEnhancedNormalDemo(); demoStep = -1; break;
+  }
+  
+  demoStep++;
+  lastDemoChange = millis();
+}
+
+void startEnhancedPressureDemo() {
+  Serial.println("🎭 Enhanced Demo: หลังซ้ายแรงกดสูง");
+  autoState.currentScenario = "DEMO_BACK_LEFT";
+  sensors.backLeft = 30.0;  // สูงกว่า threshold
+  sensors.backRight = 12.0;
+  sensors.hip = 18.0;
+  sendAutoAlert("DEMO_PRESSURE", "Demo: จำลองแรงกดหลังซ้าย 30kg", "DEMO");
+  sendLog("🎭 Demo: Simulating back left pressure");
+}
+
+void startEnhancedBalanceDemo() {
+  Serial.println("🎭 Enhanced Demo: ความไม่สมดุล");
+  autoState.currentScenario = "DEMO_BALANCE";
+  sensors.backLeft = 20.0;
+  sensors.backRight = 12.0;  // ต่าง 8kg
+  sensors.hip = 15.0;
+  sendAutoAlert("DEMO_BALANCE", "Demo: จำลองความไม่สมดุล 8kg", "DEMO");
+  sendLog("🎭 Demo: Simulating balance issue");
+}
+
+void startEnhancedHipDemo() {
+  Serial.println("🎭 Enhanced Demo: สะโพกแรงกดสูง");
+  autoState.currentScenario = "DEMO_HIP";
+  sensors.backLeft = 12.0;
+  sensors.backRight = 13.0;
+  sensors.hip = 28.0;  // สูงกว่า threshold
+  sendAutoAlert("DEMO_HIP_PRESSURE", "Demo: จำลองแรงกดสะโพก 28kg", "DEMO");
+  sendLog("🎭 Demo: Simulating hip pressure");
+}
+
+void resetToEnhancedNormalDemo() {
+  Serial.println("🎭 Enhanced Demo: รีเซ็ตเป็นปกติ");
+  autoState.currentScenario = "DEMO_NORMAL";
+  
+  sensors.backLeft = 12.0;
+  sensors.backRight = 13.0;
+  sensors.hip = 18.0;
+
+  // ตำแหน่งจริงจะอัปเดตจาก STATUS ของ Arduino
+  sendAutoAlert("DEMO_RESET", "Demo: รีเซ็ตกลับสู่ FLAT", "INFO");
+  executeEnhancedPositionChange(0, 5, 5, "Demo: รีเซ็ต", "FLAT");
+  sendLog("🎭 Demo: Reset to normal - FLAT");
+}
+
+void executeEnhancedPositionChange(int back, int side, int leg, String reason, String positionName) {
+  if (!arduinoConnected) {
+    sendLog("Positioning failed: Arduino not connected");
+    return;
+  }
+  // ✅ เช็คทุกช่องทาง (Manual / Preset / Auto / Demo) - เดิม PRESET กับ Auto ไม่เช็ค
+  if (bedStatus == "EMERGENCY") {
+    sendLog("Positioning refused: Emergency mode active");
+    return;
+  }
+  if (bedStatus == "MOVING") {
+    sendLog("Positioning refused: bed is already moving");
+    return;
+  }
+
+  targetPosition.back = back;
+  targetPosition.side = side;
+  targetPosition.leg = leg;
+
+  // ✅ ไม่ตั้ง bedPosition ล่วงหน้า - รอค่าจริงจาก STATUS ของ Arduino
+  //    (เดิมถ้า Arduino ปฏิเสธคำสั่ง ตำแหน่งใน ESP32 จะเพี้ยนจากของจริง)
+
+  String moveCommand = "MOVE:" + String(back) + "," + String(side) + "," + String(leg);
+  Serial.print("🤖 Enhanced Auto: "); Serial.println(moveCommand);
+  Serial.print("📍 Position: "); Serial.print(positionName.c_str()); Serial.print(" ("); 
+  Serial.print(back); Serial.print(","); Serial.print(side); Serial.print(","); Serial.print(leg); Serial.println(")");
+  
+  String prevStatus = bedStatus;
+  bedStatus = "MOVING";
+  sendStatus();
+
+  if (sendArduinoCommandAndWait(moveCommand, 3000)) {
+    autoState.currentPositionName = positionName;
+    sendLog(reason + " -> " + positionName + " (" + String(back) + "," + String(side) + "," + String(leg) + ")");
+  } else {
+    sendLog("Positioning failed - Arduino rejected the command or timed out");
+    bedStatus = prevStatus;   // STATUS รอบถัดไปจาก Arduino จะยืนยันสถานะจริง
+    sendStatus();
+  }
+}
+
+String positionNameFor(int back, int side, int leg) {
+  if (back == 0 && side == 5 && leg == 5) return "FLAT";
+  if (back == 7 && side == 5 && leg == 2) return "SIT";
+  if (back == 2 && side == 5 && leg == 1) return "SLEEP";
+  if (back == 0 && side == 1 && leg == 5) return "LEFT_SIDE";
+  if (back == 0 && side == 9 && leg == 5) return "RIGHT_SIDE";
+  return "CUSTOM";
+}
+
+String getEnhancedCurrentPositionName() {
+  return positionNameFor(bedPosition.back, bedPosition.side, bedPosition.leg);
+}
+
+void sendAutoAlert(String alertType, String message, String severity) {
+  if (!mqttClient.connected()) return;
+  
+  jsonDoc.clear();
+  jsonDoc["timestamp"] = millis();
+  jsonDoc["device_id"] = CLIENT_ID;
+  jsonDoc["alert_type"] = alertType;
+  jsonDoc["message"] = message;
+  jsonDoc["severity"] = severity;
+  jsonDoc["scenario"] = autoState.currentScenario;
+  jsonDoc["position_name"] = autoState.currentPositionName;
+  jsonDoc["auto_enabled"] = autoState.enabled;
+  jsonDoc["demo_running"] = autoState.demoRunning;
+  
+  JsonObject sensorData = jsonDoc.createNestedObject("sensor_data");
+  sensorData["back_left"] = sensors.backLeft;
+  sensorData["back_right"] = sensors.backRight;
+  sensorData["hip"] = sensors.hip;
+  sensorData["balance_diff"] = abs(sensors.backLeft - sensors.backRight);
+  
+  // ✅ Enhanced Alert States
+  JsonObject alertStates = jsonDoc.createNestedObject("alert_states");
+  alertStates["back_left_alert"] = autoState.backLeftAlert;
+  alertStates["back_right_alert"] = autoState.backRightAlert;
+  alertStates["hip_alert"] = autoState.hipAlert;
+  alertStates["balance_alert"] = autoState.balanceAlert;
+  
+  publishJson(TOPIC_AUTO_ALERT);
+  
+  Serial.print("🚨 Enhanced Alert ["); Serial.print(severity); Serial.print("]: "); Serial.println(message);
+}
+
+void sendAutoAction(String actionType, String action, int back, int side, int leg) {
+  if (!mqttClient.connected()) return;
+  
+  jsonDoc.clear();
+  jsonDoc["timestamp"] = millis();
+  jsonDoc["device_id"] = CLIENT_ID;
+  jsonDoc["action_type"] = actionType;
+  jsonDoc["action"] = action;
+  jsonDoc["scenario"] = autoState.currentScenario;
+  
+  JsonObject position = jsonDoc.createNestedObject("new_position");
+  position["back"] = back;
+  position["side"] = side;
+  position["leg"] = leg;
+  position["name"] = positionNameFor(back, side, leg);
+  
+  JsonObject prevPosition = jsonDoc.createNestedObject("previous_position");
+  prevPosition["back"] = bedPosition.back;
+  prevPosition["side"] = bedPosition.side;
+  prevPosition["leg"] = bedPosition.leg;
+  prevPosition["name"] = autoState.currentPositionName;
+  
+  publishJson(TOPIC_AUTO_ACTION);
+  
+  Serial.print("🤖 Enhanced Action ["); Serial.print(actionType); Serial.print("]: "); Serial.println(action);
+}
+
+// === Arduino Communication Functions (Same as original) ===
+void initializeArduinoConnection() {
+  Serial.println("🤖 Initializing Arduino connection...");
+  clearArduinoBuffer();
+  delay(1000);
+  
+  for (int i = 0; i < 3; i++) {
+    Serial.print("Attempt "); Serial.print(i + 1); Serial.println("/3...");
+    
+    if (sendArduinoCommandAndWait("PING", 2000)) {
+      Serial.println("✓ Arduino responded to PING");
+      arduinoConnected = true;
+      break;
+    }
+    delay(1000);
+  }
+  
+  if (arduinoConnected) {
+    Serial.println("✓ Arduino connection established");
+    sendArduinoCommandAndWait("STATUS", 2000);
+  } else {
+    Serial.println("⚠️ Arduino connection failed - will retry periodically");
+  }
+}
+
+// คืนค่า true เฉพาะเมื่อ Arduino ตอบรับคำสั่งจริง (false = ERROR:* หรือ timeout)
+bool sendArduinoCommandAndWait(String command, unsigned long timeout) {
+  // ✅ ประมวลผลข้อความที่ค้างอยู่ก่อน (เดิม clear ทิ้ง ทำให้ COMPLETE/EMERGENCY หาย)
+  handleArduinoSerial();
+
+  Serial.print("📤 Sending to Arduino: "); Serial.println(command);
+
+  pendingCommand = command;
+  expectedResponse = expectedReplyFor(command);
+  lastCommandOk = false;
+  waitingForResponse = true;
+  lastCommandSent = millis();
+
+  ArduinoSerial.println(command);
+  ArduinoSerial.flush();
+
+  unsigned long startTime = millis();
+  while ((millis() - startTime) < timeout) {
+    handleArduinoSerial();
+    if (!waitingForResponse) {
+      return lastCommandOk;
+    }
+    delay(5);
+  }
+
+  waitingForResponse = false;
+  return false;
+}
+
+void handleArduinoSerial() {
+  // ✅ static: เก็บข้อความที่ยังมาไม่ครบบรรทัดไว้ข้ามรอบ loop (115200 baud)
+  static String response = "";
+
+  while (ArduinoSerial.available()) {
+    char c = ArduinoSerial.read();
+    if (c == '\n' || c == '\r') {
+      if (response.length() > 0) {
+        String line = response;
+        response = "";
+        processArduinoResponse(line);
+      }
+    } else if (c >= 32 && c <= 126) {
+      response += c;
+    }
+
+    if (response.length() > 100) {
+      Serial.println("⚠️ Arduino response too long - cleared");
+      response = "";
+    }
+  }
+}
+
+// ✅ คำตอบที่ถือว่า "สำเร็จ" ของแต่ละคำสั่ง (ERROR:* = ล้มเหลว)
+String expectedReplyFor(const String& command) {
+  if (command == "PING") return "PONG";
+  if (command == "STATUS") return "STATUS:";
+  if (command.startsWith("MOVE:") || command == "RESET") return "MOVING";
+  if (command == "STOP") return "EMERGENCY";
+  return "";
+}
+
+void processArduinoResponse(String response) {
+  response.trim();
+  if (response.length() == 0) return;
+
+  lastResponseReceived = millis();
+  arduinoConnected = true;
+  connectionAttempts = 0;
+
+  // ✅ HEARTBEAT / echo ไม่ใช่คำตอบของคำสั่ง - แค่ยืนยันว่า Arduino ยังอยู่
+  if (response == "HEARTBEAT" || response.startsWith("RECEIVED:")) {
+    return;
+  }
+
+  Serial.print("📥 Arduino: "); Serial.println(response);
+
+  // ✅ เคลียร์สถานะรอ เฉพาะเมื่อได้คำตอบที่ตรงกับคำสั่งที่ส่งไป
+  if (waitingForResponse) {
+    if (response.startsWith("ERROR:")) {
+      lastCommandOk = false;
+      waitingForResponse = false;
+    } else if (expectedResponse.length() == 0 || response.startsWith(expectedResponse)) {
+      lastCommandOk = true;
+      waitingForResponse = false;
+    }
+  }
+
+  // เก็บสถานะเดิมไว้ เพื่อส่ง status ไป MQTT เฉพาะตอนที่มีการเปลี่ยนแปลง
+  String prevBedStatus = bedStatus;
+  String prevArduinoStatus = arduinoStatus;
+  int prevBack = bedPosition.back, prevSide = bedPosition.side, prevLeg = bedPosition.leg;
+
+  if (response.startsWith("STATUS:")) {
+    parseArduinoStatus(response.substring(7));
+    arduinoStatus = "CONNECTED";
+  } else if (response == "PONG") {
+    Serial.println("✓ Arduino PING successful");
+    arduinoStatus = "CONNECTED";
+  } else if (response == "MOVING") {
+    bedStatus = "MOVING";
+    sendLog("Arduino: Movement started");
+  } else if (response == "MANUAL_COMPLETE") {
+    bedStatus = "READY";
+    sendLog("Arduino: Manual actuator correction completed");
+  } else if (response == "COMPLETE") {
+    // Arduino ส่ง STATUS ตามมาเองหลัง COMPLETE ไม่ต้องสั่ง STATUS ซ้อน (กันการเรียกซ้อนกัน)
+    bedStatus = "READY";
+    sendLog("Arduino: Movement completed");
+  } else if (response == "EMERGENCY") {
+    bedStatus = "EMERGENCY";
+    autoState.enabled = false; 
+    sendLog("Arduino: EMERGENCY STOP!");
+  } else if (response == "RESET_COMPLETE") {
+    bedStatus = "READY";
+    sendLog("Arduino: System reset");
+  } else if (response.startsWith("Back:") || response.startsWith("Side:") || response.startsWith("Leg:")) {
+    sendLog("Arduino: " + response);
+  } else if (response.startsWith("ERROR:")) {
+    sendLog("Arduino Error: " + response);
+  } else if (response == "ARDUINO_READY") {
+    arduinoConnected = true;
+    arduinoStatus = "READY";
+    sendLog("Arduino: System ready");
+  } else {
+    sendLog("Arduino: " + response);
+  }
+
+  // ✅ ส่ง status เฉพาะเมื่อมีอะไรเปลี่ยน (เดิมส่งทุกบรรทัด ทำให้ MQTT ท่วม)
+  if (bedStatus != prevBedStatus || arduinoStatus != prevArduinoStatus ||
+      bedPosition.back != prevBack || bedPosition.side != prevSide || bedPosition.leg != prevLeg) {
+    sendStatus();
+  }
+}
+
+void parseArduinoStatus(String statusData) {
+  int commaIndex1 = statusData.indexOf(',');
+  int commaIndex2 = statusData.indexOf(',', commaIndex1 + 1);
+  int commaIndex3 = statusData.indexOf(',', commaIndex2 + 1);
+  
+  if (commaIndex1 > 0 && commaIndex2 > 0) {
+    String backStr = statusData.substring(1, commaIndex1); 
+    String sideStr = statusData.substring(commaIndex1 + 2, commaIndex2); 
+    String legStr = statusData.substring(commaIndex2 + 2, commaIndex3 > 0 ? commaIndex3 : statusData.length()); 
+    
+    int newBack = backStr.toInt();
+    int newSide = sideStr.toInt();
+    int newLeg = legStr.toInt();
+    
+    // ✅ ตำแหน่งจาก Arduino คือตำแหน่งจริง - ใช้ค่านี้เสมอ (ESP32 ไม่เดาตำแหน่งล่วงหน้าแล้ว)
+    bedPosition.back = constrain(newBack, -10, 10);
+    bedPosition.side = constrain(newSide, -10, 10);
+    bedPosition.leg = constrain(newLeg, -10, 10);
+
+    if (commaIndex3 > 0) {
+      String status = statusData.substring(commaIndex3 + 1);
+      status.trim();
+
+      if (status == "EMERGENCY") {
+        bedStatus = "EMERGENCY";
+      } else if (status == "MOVING") {
+        bedStatus = "MOVING";
+      } else if (status == "READY") {
+        bedStatus = "READY";
+        autoState.currentPositionName = getEnhancedCurrentPositionName();
+      }
+      
+      arduinoStatus = status;
+    }
+    
+    Serial.print("📊 Arduino Status: "); Serial.print(autoState.currentPositionName.c_str());
+    Serial.print(" ("); Serial.print(newBack); Serial.print(","); Serial.print(newSide); Serial.print(","); Serial.print(newLeg);
+    Serial.print("), Status="); Serial.println(arduinoStatus.c_str());
+  }
+}
+
+void checkArduinoConnection() {
+  if (!waitingForResponse) {
+    if (arduinoConnected) {
+      // ✅ Arduino ส่ง HEARTBEAT ทุก 1 วินาที ถ้ายังได้รับอยู่ไม่ต้อง PING (ไม่ต้องบล็อก loop)
+      if (millis() - lastResponseReceived < PING_INTERVAL) return;
+      if (!sendArduinoCommandAndWait("PING", 1000)) {
+        handleArduinoTimeout();
+      }
+    } else {
+      Serial.print("🔄 Attempting to reconnect to Arduino... ");
+      if (sendArduinoCommandAndWait("PING", 2000)) {
+        Serial.println("✓ Reconnected!");
+        arduinoConnected = true;
+        sendLog("Arduino reconnected");
+      } else {
+        Serial.println("❌ Still disconnected");
+        connectionAttempts++;
+        if (connectionAttempts >= maxConnectionAttempts) {
+          Serial.println("⚠️ Max connection attempts reached");
+        }
+      }
+    }
+  }
+}
+
+void handleArduinoTimeout() {
+  waitingForResponse = false;
+  connectionAttempts++;
+  
+  if (connectionAttempts >= maxConnectionAttempts) {
+    arduinoConnected = false;
+    arduinoStatus = "TIMEOUT";
+    sendLog("Arduino communication timeout - marked as disconnected");
+  } else {
+    sendLog("Arduino timeout - retrying...");
+  }
+}
+
+void clearArduinoBuffer() {
+  while (ArduinoSerial.available()) {
+    ArduinoSerial.read();
+  }
+  delay(50);
+}
+
+// === MQTT Callback & Command Processing ===
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.println(); Serial.println("📨 Enhanced Dashboard Command:");
+  Serial.print("Topic: "); Serial.println(topic);
+  Serial.print("Message: "); Serial.println(message);
+  
+  // ✅ ใช้ document แยกสำหรับคำสั่ง - jsonDoc ตัวกลางถูก sendLog()/sendStatus() ล้างทิ้งระหว่างประมวลผล
+  StaticJsonDocument<512> cmdDoc;
+  DeserializationError error = deserializeJson(cmdDoc, message);
+  if (error) {
+    Serial.print("❌ JSON parsing failed: "); Serial.println(error.c_str());
+    return;
+  }
+
+  const char* cmd = cmdDoc["command"];
+  if (!cmd) {
+    Serial.println("❌ No command in message");
+    return;
+  }
+
+  String command = String(cmd);
+  command.toUpperCase();
+
+  Serial.print("🎮 Processing Enhanced command: "); Serial.println(command);
+  processEnhancedCommand(command, cmdDoc);
+}
+
+void processEnhancedCommand(String command, JsonDocument& data) {
+  justReceivedCommand = true;
+  lastCommandTime = millis();
+  
+  if (command == "STATUS") {
+    Serial.println("📊 Dashboard requested status");
+    if (arduinoConnected) {
+      sendArduinoCommandAndWait("STATUS", 2000);
+    }
+    sendStatus();
+    sendSensorData();
+  }
+  else if (command == "MOVE") {
+    if (!arduinoConnected) {
+      Serial.println("❌ Cannot move - Arduino not connected");
+      sendLog("Move failed: Arduino not connected");
+      return;
+    }
+    
+    if (bedStatus == "EMERGENCY") {
+      sendLog("Move failed: Emergency mode active");
+      return;
+    }
+    
+    int back = data["back"] | bedPosition.back;
+    int side = data["side"] | bedPosition.side;
+    int leg = data["leg"] | bedPosition.leg;
+    
+    back = constrain(back, -10, 10);
+    side = constrain(side, -10, 10);
+    leg = constrain(leg, -10, 10);
+    
+    String posName = positionNameFor(back, side, leg);  // ✅ ชื่อของตำแหน่งใหม่ (เดิมใช้ตำแหน่งเก่า)
+    executeEnhancedPositionChange(back, side, leg, "Manual Control", posName);
+  }
+  else if (command == "PRESET") {
+    if (!arduinoConnected) {
+      sendLog("Preset failed: Arduino not connected");
+      return;
+    }
+    
+    const char* preset = data["preset"];
+    if (!preset) return;
+    
+    int back, side, leg;
+    String posName;
+    
+    if (strcmp(preset, "FLAT") == 0) {
+      back = 0; side = 5; leg = 5; posName = "FLAT";
+    } else if (strcmp(preset, "SIT") == 0) {
+      back = 7; side = 5; leg = 2; posName = "SIT";
+    } else if (strcmp(preset, "SLEEP") == 0) {
+      back = 2; side = 5; leg = 1; posName = "SLEEP";
+    } else if (strcmp(preset, "LEFT_SIDE") == 0) {
+      back = 0; side = 1; leg = 5; posName = "LEFT_SIDE";  // ✅ New preset
+    } else if (strcmp(preset, "RIGHT_SIDE") == 0) {
+      back = 0; side = 9; leg = 5; posName = "RIGHT_SIDE"; // ✅ New preset
+    } else {
+      return;
+    }
+    
+    executeEnhancedPositionChange(back, side, leg, "Preset: " + String(preset), posName);
+  }
+  else if (command == "AUTO") {
+    bool enable = data["enable"] | false;
+    autoState.enabled = enable;
+    
+    if (enable) {
+      // รีเซ็ตตัวจับเวลาทั้งหมด
+      autoState.backLeftHighStart = 0;
+      autoState.backRightHighStart = 0;
+      autoState.hipHighStart = 0;
+      autoState.balanceIssueStart = 0;
+      
+      autoState.emergencyMode = false;
+      autoState.currentScenario = "IDLE";
+      
+      // รีเซ็ต Alert States
+      autoState.backLeftAlert = false;
+      autoState.backRightAlert = false;
+      autoState.hipAlert = false;
+      autoState.balanceAlert = false;
+      
+      sendLog("Enhanced Auto mode enabled - weight-based monitoring started");
+    } else {
+      autoState.demoRunning = false;
+      autoState.emergencyMode = false;
+      autoState.currentScenario = "IDLE";
+      sendLog("Enhanced Auto mode disabled");
+    }
+    
+    Serial.print("⚙️ Enhanced Auto mode: "); Serial.println(enable ? "ENABLED" : "DISABLED");
+    sendStatus();
+  }
+  else if (command == "DEMO") {
+    String demoAction = data["action"] | "start";
+    
+    if (demoAction == "start") {
+      autoState.demoRunning = true;
+      autoState.enabled = true; 
+      autoState.currentScenario = "DEMO_STARTING";
+      sendLog("🎭 Enhanced Demo mode started!");
+      sendAutoAlert("DEMO_STARTED", "เริ่ม Enhanced Demo การปรับตำแหน่งอัตโนมัติ", "INFO");
+    } else if (demoAction == "stop") {
+      autoState.demoRunning = false;
+      autoState.currentScenario = "IDLE";
+      sendLog("🎭 Enhanced Demo mode stopped");
+      sendAutoAlert("DEMO_STOPPED", "หยุด Enhanced Demo", "INFO");
+    }
+    
+    Serial.print("🎭 Enhanced Demo mode: "); Serial.println(autoState.demoRunning ? "STARTED" : "STOPPED");
+    sendStatus();
+  }
+  else if (command == "AUTO_CONFIG") {
+    // ✅ Enhanced Auto Configuration
+    if (data.containsKey("pressure_seconds")) {
+      autoConfig.pressureCheckSeconds = data["pressure_seconds"] | autoConfig.pressureCheckSeconds;
+    }
+    if (data.containsKey("balance_seconds")) {
+      autoConfig.balanceCheckSeconds = data["balance_seconds"] | autoConfig.balanceCheckSeconds;
+    }
+    if (data.containsKey("hip_seconds")) {
+      autoConfig.hipPressureSeconds = data["hip_seconds"] | autoConfig.hipPressureSeconds;
+    }
+    if (data.containsKey("pressure_threshold")) {
+      autoConfig.highPressureThreshold = data["pressure_threshold"] | autoConfig.highPressureThreshold;
+    }
+    if (data.containsKey("balance_threshold")) {
+      autoConfig.balanceThreshold = data["balance_threshold"] | autoConfig.balanceThreshold;
+    }
+    
+    Serial.println("⚙️ Enhanced Auto Config Updated:");
+    Serial.print("   Pressure: "); Serial.print(autoConfig.pressureCheckSeconds); Serial.println("s");
+    Serial.print("   Balance: "); Serial.print(autoConfig.balanceCheckSeconds); Serial.println("s");
+    Serial.print("   Hip: "); Serial.print(autoConfig.hipPressureSeconds); Serial.println("s");
+    
+    sendLog("Enhanced Auto configuration updated");
+    sendStatus();
+  }
+  else if (command == "STOP") {
+    Serial.println("🛑 EMERGENCY STOP from Dashboard!");
+    
+    if (arduinoConnected) {
+      sendArduinoCommandAndWait("STOP", 2000);
+    }
+    
+    bedStatus = "EMERGENCY";
+    autoState.enabled = false;
+    autoState.demoRunning = false;
+    
+    sendLog("EMERGENCY STOP activated from Dashboard!");
+    sendStatus();
+  }
+  else if (command == "RESET") {
+    Serial.println("🔄 System Reset from Dashboard");
+    
+    if (arduinoConnected) {
+      sendArduinoCommandAndWait("RESET", 2000);
+    }
+    
+    autoState.enabled = false;
+    autoState.demoRunning = false;
+    autoState.emergencyMode = false;
+    autoState.currentScenario = "IDLE";
+    autoState.currentPositionName = "FLAT";
+    
+    // รีเซ็ตตัวจับเวลา
+    autoState.backLeftHighStart = 0;
+    autoState.backRightHighStart = 0;
+    autoState.hipHighStart = 0;
+    autoState.balanceIssueStart = 0;
+    
+    sendLog("Enhanced System reset from Dashboard - returning to FLAT");
+  }
+  else {
+    Serial.print("❓ Unknown command: "); Serial.println(command);
+  }
+}
+
+// === Data Sending Functions ===
+void sendStatus() {
+  if (!mqttClient.connected()) return;
+  
+  jsonDoc.clear();
+  jsonDoc["timestamp"] = millis();
+  jsonDoc["device_id"] = CLIENT_ID;
+  jsonDoc["uptime"] = (millis() - systemStartTime) / 1000;
+  
+  JsonObject position = jsonDoc.createNestedObject("position");
+  position["back"] = bedPosition.back;
+  position["side"] = bedPosition.side;
+  position["leg"] = bedPosition.leg;
+  position["name"] = autoState.currentPositionName;
+  
+  JsonObject target = jsonDoc.createNestedObject("target");
+  target["back"] = targetPosition.back;
+  target["side"] = targetPosition.side;
+  target["leg"] = targetPosition.leg;
+  
+  jsonDoc["mode"] = autoState.enabled ? "AUTO" : "MANUAL";
+  jsonDoc["status"] = bedStatus;
+  jsonDoc["arduino_connected"] = arduinoConnected;
+  jsonDoc["arduino_status"] = arduinoStatus;
+  jsonDoc["connection_attempts"] = connectionAttempts;
+  jsonDoc["wifi_rssi"] = WiFi.RSSI();
+  jsonDoc["free_heap"] = ESP.getFreeHeap();
+  jsonDoc["loadcells_ready"] = loadCellsReady;
+  
+  // ✅ Enhanced Auto Status
+  JsonObject autoStatus = jsonDoc.createNestedObject("auto_mode");
+  autoStatus["enabled"] = autoState.enabled;
+  autoStatus["demo_running"] = autoState.demoRunning;
+  autoStatus["emergency_mode"] = autoState.emergencyMode;
+  autoStatus["current_scenario"] = autoState.currentScenario;
+  autoStatus["back_left_alert"] = autoState.backLeftAlert;
+  autoStatus["back_right_alert"] = autoState.backRightAlert;
+  autoStatus["hip_alert"] = autoState.hipAlert;
+  autoStatus["balance_alert"] = autoState.balanceAlert;
+  
+  // ✅ Enhanced Configuration
+  JsonObject autoConfigObj = jsonDoc.createNestedObject("auto_config");
+  autoConfigObj["pressure_seconds"] = autoConfig.pressureCheckSeconds;
+  autoConfigObj["balance_seconds"] = autoConfig.balanceCheckSeconds;
+  autoConfigObj["hip_seconds"] = autoConfig.hipPressureSeconds;
+  autoConfigObj["pressure_threshold"] = autoConfig.highPressureThreshold;
+  autoConfigObj["balance_threshold"] = autoConfig.balanceThreshold;
+  
+  publishJson(TOPIC_STATUS);
+  
+  Serial.println("📤 Enhanced Status sent to Dashboard");
+}
+
+void sendSensorData() {
+  if (!mqttClient.connected()) return;
+  
+  jsonDoc.clear();
+  jsonDoc["timestamp"] = millis();
+  
+  JsonObject sensorObj = jsonDoc.createNestedObject("sensors");
+  sensorObj["back_left"] = sensors.backLeft;
+  sensorObj["back_right"] = sensors.backRight;
+  sensorObj["hip"] = sensors.hip;
+  sensorObj["total"] = sensors.backLeft + sensors.backRight + sensors.hip;
+  
+  JsonObject pressure = jsonDoc.createNestedObject("pressure_alert");
+  pressure["back_left"] = (sensors.backLeft > autoConfig.highPressureThreshold);
+  pressure["back_right"] = (sensors.backRight > autoConfig.highPressureThreshold);
+  pressure["hip"] = (sensors.hip > autoConfig.highPressureThreshold);
+  
+  float diff = abs(sensors.backLeft - sensors.backRight);
+  jsonDoc["balance_diff"] = diff;
+  jsonDoc["unbalanced"] = (diff > autoConfig.balanceThreshold);
+  
+  JsonObject loadcell_status = jsonDoc.createNestedObject("loadcell_status");
+  loadcell_status["back_left_ready"] = loadCellStatus.backLeftReady;
+  loadcell_status["back_right_ready"] = loadCellStatus.backRightReady;
+  loadcell_status["hip_ready"] = loadCellStatus.hipReady;
+  loadcell_status["all_ready"] = loadCellsReady;
+  
+  JsonObject thresholds = jsonDoc.createNestedObject("auto_thresholds");
+  thresholds["high_pressure"] = autoConfig.highPressureThreshold;
+  thresholds["balance"] = autoConfig.balanceThreshold;
+  
+  publishJson(TOPIC_SENSOR);
+}
+
+void sendHeartbeat() {
+  if (!mqttClient.connected()) return;
+  
+  jsonDoc.clear();
+  jsonDoc["device_id"] = CLIENT_ID;
+  jsonDoc["timestamp"] = millis();
+  jsonDoc["uptime"] = (millis() - systemStartTime) / 1000;
+  jsonDoc["free_heap"] = ESP.getFreeHeap();
+  jsonDoc["wifi_rssi"] = WiFi.RSSI();
+  jsonDoc["arduino_connected"] = arduinoConnected;
+  jsonDoc["loadcells_ready"] = loadCellsReady;
+  jsonDoc["auto_enabled"] = autoState.enabled;
+  jsonDoc["demo_running"] = autoState.demoRunning;
+  jsonDoc["position_name"] = autoState.currentPositionName;
+  
+  publishJson(TOPIC_HEARTBEAT);
+  
+  Serial.println("💓 Enhanced Heartbeat sent to Dashboard");
+}
+
+void sendLog(String message) {
+  if (!mqttClient.connected()) return;
+  
+  jsonDoc.clear();
+  jsonDoc["timestamp"] = millis();
+  jsonDoc["device_id"] = CLIENT_ID;
+  jsonDoc["message"] = message;
+  
+  publishJson(TOPIC_LOG);
+  
+  Serial.print("📝 Log: "); Serial.println(message);
+}
+
+// === Utility Functions ===
+void updateLEDs() {
+  if (systemReady && WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
+    digitalWrite(LED_STATUS, HIGH);
+  } else {
+    digitalWrite(LED_STATUS, millis() % 1000 < 500);
+  }
+  
+  digitalWrite(LED_WIFI, WiFi.status() == WL_CONNECTED);
+  digitalWrite(LED_MQTT, mqttClient.connected());
+  
+  if (arduinoConnected && (loadCellsReady || !autoConfig.demoMode)) {
+    digitalWrite(LED_ARDUINO, HIGH);
+  } else {
+    digitalWrite(LED_ARDUINO, millis() % 2000 < 1000);
+  }
+}
+
+// === Serial Commands ===
+void handleSerialCommands() {
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  
+  if (cmd.length() == 0) return;
+  
+  Serial.println(); Serial.print("💻 Enhanced Serial Command: "); Serial.println(cmd);
+  
+  char firstChar = cmd.charAt(0);
+  
+  switch (firstChar) {
+    case 't':
+    case 'T':
+      tareAllLoadCells();
+      break;
+      
+    case 'r':
+    case 'R':
+      calibrationMenu();
+      break;
+      
+    case 'i':
+    case 'I':
+      printEnhancedLoadCellInfo();
+      break;
+      
+    case 'h':
+    case 'H':
+      printEnhancedHelp();
+      break;
+      
+    default:
+      cmd.toUpperCase();
+      if (cmd == "AUTO ON") {
+        autoState.enabled = true;
+        Serial.println("🤖 Enhanced Auto mode enabled via serial");
+        sendLog("Enhanced Auto mode enabled via serial");
+      }
+      else if (cmd == "AUTO OFF") {
+        autoState.enabled = false;
+        autoState.demoRunning = false;
+        Serial.println("🤖 Enhanced Auto mode disabled via serial");
+        sendLog("Enhanced Auto mode disabled via serial");
+      }
+      else if (cmd == "DEMO START") {
+        autoState.demoRunning = true;
+        autoState.enabled = true;
+        Serial.println("🎭 Enhanced Demo started via serial");
+        sendLog("Enhanced Demo started via serial");
+      }
+      else if (cmd == "DEMO STOP") {
+        autoState.demoRunning = false;
+        Serial.println("🎭 Enhanced Demo stopped via serial");
+        sendLog("Enhanced Demo stopped via serial");
+      }
+      else if (cmd == "STATUS" || cmd == "?") {
+        printEnhancedSystemStatus();
+      }
+      else if (cmd == "CONFIG") {
+        printEnhancedAutoConfig();
+      }
+      else if (cmd == "ARDUINO") {
+        testArduinoConnection();
+      }
+      else if (cmd == "RECONNECT") {
+        reconnectArduino();
+      }
+      else if (cmd == "TEST") {
+        testEnhancedDashboardConnection();
+      }
+      else if (cmd.startsWith("MOVE ")) {
+        String params = cmd.substring(5);
+        processEnhancedManualMove(params);
+      }
+      else if (cmd.startsWith("PRESET ")) {
+        String preset = cmd.substring(7);
+        processEnhancedPresetMove(preset);
+      }
+      else {
+        Serial.println("❓ Unknown command. Type 'h' for available commands.");
+      }
+      break;
+  }
+}
+
+void calibrationMenu() {
+  Serial.println(); Serial.println("🔧 Enhanced Load Cell Calibration Menu");
+  Serial.println("════════════════════════════════════════════");
+  Serial.println("⚠️  CALIBRATION ปิดใช้งานในโหมดนี้");
+  Serial.println("💡 วิธีการ calibrate:");
+  Serial.println("   1. ใช้โค้ด 'ESP32 + HX711_ADC + 3 Load Cells'");
+  Serial.println("   2. ทำ calibration ครบ 3 ตัว");
+  Serial.println("   3. เอาค่าที่ได้ใส่ในฟังก์ชัน loadCalibrationFromStorage()");
+  Serial.println("   4. อัปโหลดโค้ดใหม่");
+  Serial.println("════════════════════════════════════════════");
+  Serial.println("📊 ค่า Calibration ปัจจุบัน:");
+  
+  if (loadCellStatus.backLeftReady) {
+    Serial.print("   หลังซ้าย: "); Serial.println(LoadCell_BackLeft.getCalFactor(), 2);
+  }
+  if (loadCellStatus.backRightReady) {
+    Serial.print("   หลังขวา: "); Serial.println(LoadCell_BackRight.getCalFactor(), 2);
+  }
+  if (loadCellStatus.hipReady) {
+    Serial.print("   สะโพก: "); Serial.println(LoadCell_Hip.getCalFactor(), 2);
+  }
+  
+  Serial.println("════════════════════════════════════════════");
+  
+  while (Serial.available()) {
+    Serial.read();
+  }
+}
+
+void printEnhancedLoadCellInfo() {
+  Serial.println(); Serial.println("📊 Enhanced Load Cell Information:");
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  
+  Serial.print("📍 หลังซ้าย:  DT="); Serial.print(HX711_BACK_LEFT_DT); Serial.print(", SCK="); Serial.println(HX711_BACK_LEFT_SCK);
+  Serial.print("   Ready: "); Serial.println(loadCellStatus.backLeftReady ? "✅ Yes" : "❌ No");
+  if (loadCellStatus.backLeftReady) {
+    Serial.print("   Calibration: "); Serial.println(LoadCell_BackLeft.getCalFactor(), 2);
+  }
+  Serial.print("   Current: "); Serial.print(sensors.backLeft, 2); Serial.print(" kg");
+  if (autoState.backLeftAlert) Serial.print(" 🚨 HIGH");
+  Serial.println();
+  
+  Serial.print("📍 หลังขวา:   DT="); Serial.print(HX711_BACK_RIGHT_DT); Serial.print(", SCK="); Serial.println(HX711_BACK_RIGHT_SCK);
+  Serial.print("   Ready: "); Serial.println(loadCellStatus.backRightReady ? "✅ Yes" : "❌ No");
+  if (loadCellStatus.backRightReady) {
+    Serial.print("   Calibration: "); Serial.println(LoadCell_BackRight.getCalFactor(), 2);
+  }
+  Serial.print("   Current: "); Serial.print(sensors.backRight, 2); Serial.print(" kg");
+  if (autoState.backRightAlert) Serial.print(" 🚨 HIGH");
+  Serial.println();
+  
+  Serial.print("📍 สะโพก:    DT="); Serial.print(HX711_HIP_DT); Serial.print(", SCK="); Serial.println(HX711_HIP_SCK);
+  Serial.print("   Ready: "); Serial.println(loadCellStatus.hipReady ? "✅ Yes" : "❌ No");
+  if (loadCellStatus.hipReady) {
+    Serial.print("   Calibration: "); Serial.println(LoadCell_Hip.getCalFactor(), 2);
+  }
+  Serial.print("   Current: "); Serial.print(sensors.hip, 2); Serial.print(" kg");
+  if (autoState.hipAlert) Serial.print(" 🚨 HIGH");
+  Serial.println();
+  
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.print("📊 รวมทั้งหมด: "); Serial.print(sensors.backLeft + sensors.backRight + sensors.hip, 2); Serial.println(" kg");
+  Serial.print("⚖️ สมดุลซ้าย-ขวา: "); Serial.print(abs(sensors.backLeft - sensors.backRight), 2); Serial.print(" kg");
+  if (autoState.balanceAlert) Serial.print(" ⚠️ UNBALANCED");
+  Serial.println();
+  
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.print("🤖 Enhanced Auto Mode: "); Serial.println(autoState.enabled ? "✅ Enabled" : "❌ Disabled");
+  Serial.print("🎭 Demo Mode: "); Serial.println(autoState.demoRunning ? "✅ Running" : "❌ Stopped");
+  Serial.print("📋 Current Scenario: "); Serial.println(autoState.currentScenario.c_str());
+  Serial.print("📍 Current Position: "); Serial.print(autoState.currentPositionName.c_str());
+  Serial.print(" ("); Serial.print(bedPosition.back); Serial.print(","); Serial.print(bedPosition.side); Serial.print(","); Serial.print(bedPosition.leg); Serial.println(")");
+  
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.println("🆕 Enhanced Presets Available:");
+  Serial.println("   ✅ FLAT:       (0,5,5) - Default/ราบเรียง");
+  Serial.println("   📖 SIT:        (7,5,2) - นั่งอ่านหนังสือ");
+  Serial.println("   😴 SLEEP:      (2,5,1) - นอนพักผ่อน");
+  Serial.println("   ⬅️ LEFT_SIDE:  (0,1,5) - ตะแคงซ้าย");
+  Serial.println("   ➡️ RIGHT_SIDE: (0,9,5) - ตะแคงขวา");
+  Serial.println();
+}
+
+void printEnhancedAutoConfig() {
+  Serial.println(); Serial.println("⚙️ Enhanced Auto Configuration:");
+  Serial.println("════════════════════════════════════════════");
+  Serial.print("🕐 Pressure Check Time: "); Serial.print(autoConfig.pressureCheckSeconds); Serial.println(" วินาที");
+  Serial.print("🕐 Balance Check Time: "); Serial.print(autoConfig.balanceCheckSeconds); Serial.println(" วินาที");
+  Serial.print("🕐 Hip Pressure Time: "); Serial.print(autoConfig.hipPressureSeconds); Serial.println(" วินาที");
+  Serial.print("📊 High Pressure Threshold: "); Serial.print(autoConfig.highPressureThreshold); Serial.println(" kg");
+  Serial.print("⚖️ Balance Threshold: "); Serial.print(autoConfig.balanceThreshold); Serial.println(" kg");
+  Serial.print("🔒 Restrict Back When Side: "); Serial.println(autoConfig.restrictBackWhenSide ? "✅ Yes" : "❌ No");
+  Serial.print("🆕 Enable Side Correction: "); Serial.println(autoConfig.enableSideCorrection ? "✅ Yes" : "❌ No");
+  Serial.println("════════════════════════════════════════════");
+}
+
+void testArduinoConnection() {
+  Serial.println("🧪 Testing Arduino connection...");
+  
+  if (sendArduinoCommandAndWait("PING", 3000)) {
+    Serial.println("✓ PING successful");
+    
+    if (sendArduinoCommandAndWait("STATUS", 3000)) {
+      Serial.println("✓ STATUS successful");
+    } else {
+      Serial.println("❌ STATUS failed");
+    }
+  } else {
+    Serial.println("❌ PING failed");
+  }
+}
+
+void reconnectArduino() {
+  Serial.println("🔄 Force reconnecting to Arduino...");
+  
+  arduinoConnected = false;
+  connectionAttempts = 0;
+  clearArduinoBuffer();
+  delay(1000);
+  
+  initializeArduinoConnection();
+}
+
+void processEnhancedManualMove(String params) {
+  int comma1 = params.indexOf(',');
+  int comma2 = params.lastIndexOf(',');
+  
+  if (comma1 > 0 && comma2 > comma1) {
+    int back = params.substring(0, comma1).toInt();
+    int side = params.substring(comma1 + 1, comma2).toInt();
+    int leg = params.substring(comma2 + 1).toInt();
+    
+    back = constrain(back, -10, 10);
+    side = constrain(side, -10, 10);
+    leg = constrain(leg, -10, 10);
+    
+    String posName = positionNameFor(back, side, leg);  // ✅ ชื่อของตำแหน่งใหม่ (เดิมใช้ตำแหน่งเก่า)
+    executeEnhancedPositionChange(back, side, leg, "Manual Serial Command", posName);
+    Serial.print("✓ Enhanced manual move: "); Serial.print(back); Serial.print(","); Serial.print(side); Serial.print(","); Serial.println(leg);
+  } else {
+    Serial.println("❌ Invalid format. Use: MOVE back,side,leg (e.g., MOVE 0,5,5)");
+  }
+}
+
+void processEnhancedPresetMove(String preset) {
+  preset.toUpperCase();
+  
+  int back, side, leg;
+  String posName;
+  
+  if (preset == "FLAT") {
+    back = 0; side = 5; leg = 5; posName = "FLAT";
+  } else if (preset == "SIT") {
+    back = 7; side = 5; leg = 2; posName = "SIT";
+  } else if (preset == "SLEEP") {
+    back = 2; side = 5; leg = 1; posName = "SLEEP";
+  } else if (preset == "LEFT_SIDE" || preset == "LEFT") {
+    back = 0; side = 1; leg = 5; posName = "LEFT_SIDE";
+  } else if (preset == "RIGHT_SIDE" || preset == "RIGHT") {
+    back = 0; side = 9; leg = 5; posName = "RIGHT_SIDE";
+  } else {
+    Serial.println("❌ Unknown preset. Available: FLAT, SIT, SLEEP, LEFT_SIDE, RIGHT_SIDE");
+    return;
+  }
+  
+  executeEnhancedPositionChange(back, side, leg, "Serial Preset: " + preset, posName);
+  Serial.print("✓ Enhanced preset: "); Serial.print(preset.c_str()); Serial.print(" -> "); Serial.print(posName.c_str());
+  Serial.print(" ("); Serial.print(back); Serial.print(","); Serial.print(side); Serial.print(","); Serial.print(leg); Serial.println(")");
+}
+
+void testEnhancedDashboardConnection() {
+  Serial.println("🧪 Testing Enhanced Dashboard Connection...");
+  sendSensorData();
+  sendStatus();
+  sendLog("Enhanced Dashboard connection test from ESP32 - Side Presets Ready");
+  sendAutoAlert("CONNECTION_TEST", "ทดสอบการเชื่อมต่อ Enhanced Dashboard", "INFO");
+  Serial.println("✓ Enhanced test data sent to Dashboard");
+}
+
+void printEnhancedSystemStatus() {
+  Serial.println(); Serial.println("╔══════════ ENHANCED SYSTEM STATUS ══════════════╗");
+  Serial.print("║ Uptime: "); Serial.print((millis() - systemStartTime) / 1000); Serial.println(" seconds                          ║");
+  Serial.print("║ Free Heap: "); Serial.print(ESP.getFreeHeap()); Serial.println(" bytes                         ║");
+  
+  Serial.print("║ WiFi: "); Serial.println(WiFi.status() == WL_CONNECTED ? "Connected ✓                          ║" : "Disconnected ❌                       ║");
+  Serial.print("║ MQTT: "); Serial.println(mqttClient.connected() ? "Connected ✓                          ║" : "Disconnected ❌                       ║");
+  
+  Serial.print("║ Arduino: ");
+  if (arduinoConnected) {
+    Serial.println("Connected ✓                        ║");
+  } else {
+    Serial.print("Disconnected ❌ (attempts: "); Serial.print(connectionAttempts); Serial.println(")       ║");
+  }
+  
+  Serial.print("║ Load Cells: ");
+  if (loadCellsReady) {
+    Serial.println("Ready ✅                          ║");
+  } else {
+    Serial.println("Simulated 📊                      ║");
+  }
+  
+  Serial.print("║ Arduino Status: "); Serial.print(arduinoStatus.c_str()); Serial.println("                         ║");
+  
+  Serial.print("║ Position: "); Serial.print(autoState.currentPositionName.c_str());
+  Serial.print(" ("); Serial.print(bedPosition.back); Serial.print(","); Serial.print(bedPosition.side); Serial.print(","); Serial.print(bedPosition.leg); Serial.print(")");
+  for (int i = autoState.currentPositionName.length() + 7; i < 30; i++) Serial.print(" ");
+  Serial.println("║");
+  
+  Serial.print("║ Bed Status: "); Serial.print(bedStatus.c_str()); Serial.println("                             ║");
+  
+  Serial.println("║ ━━━━━━━━━ ENHANCED AUTO MODE ━━━━━━━━━━━━━━━━   ║");
+  Serial.print("║ Auto Mode: "); Serial.println(autoState.enabled ? "✅ Enabled                         ║" : "❌ Disabled                        ║");
+  Serial.print("║ Demo Running: "); Serial.println(autoState.demoRunning ? "✅ Yes                           ║" : "❌ No                            ║");
+  Serial.print("║ Current Scenario: "); Serial.print(autoState.currentScenario.c_str());
+  for (int i = autoState.currentScenario.length(); i < 22; i++) Serial.print(" ");
+  Serial.println("║");
+  Serial.print("║ Emergency Mode: "); Serial.println(autoState.emergencyMode ? "🚨 Yes                        ║" : "✅ No                         ║");
+  
+  Serial.println("║ ━━━━━━━━━ ENHANCED SENSORS ━━━━━━━━━━━━━━━━━   ║");
+  Serial.print("║   หลังซ้าย: "); Serial.print(sensors.backLeft, 1); Serial.print(" kg ");
+  Serial.print(autoState.backLeftAlert ? "🚨" : (sensors.backLeft > autoConfig.highPressureThreshold ? "⚠️" : "✅"));
+  Serial.println("                      ║");
+  Serial.print("║   หลังขวา: "); Serial.print(sensors.backRight, 1); Serial.print(" kg ");
+  Serial.print(autoState.backRightAlert ? "🚨" : (sensors.backRight > autoConfig.highPressureThreshold ? "⚠️" : "✅"));
+  Serial.println("                       ║");
+  Serial.print("║   สะโพก: "); Serial.print(sensors.hip, 1); Serial.print(" kg ");
+  Serial.print(autoState.hipAlert ? "🚨" : (sensors.hip > autoConfig.highPressureThreshold ? "⚠️" : "✅"));
+  Serial.println("                         ║");
+  Serial.print("║   รวม: "); Serial.print(sensors.backLeft + sensors.backRight + sensors.hip, 1); Serial.println(" kg                               ║");
+  
+  float balanceDiff = abs(sensors.backLeft - sensors.backRight);
+  Serial.print("║   สมดุล: "); Serial.print(balanceDiff, 1); Serial.print(" kg ");
+  Serial.print(autoState.balanceAlert ? "🚨" : (balanceDiff > autoConfig.balanceThreshold ? "⚠️" : "✅"));
+  Serial.println("                         ║");
+  
+  Serial.println("║ ━━━━━━━━━ ENHANCED CONFIG ━━━━━━━━━━━━━━━━━━   ║");
+  Serial.print("║ Pressure Check: "); Serial.print(autoConfig.pressureCheckSeconds); Serial.println("s                      ║");
+  Serial.print("║ Balance Check: "); Serial.print(autoConfig.balanceCheckSeconds); Serial.println("s                       ║");
+  Serial.print("║ Hip Check: "); Serial.print(autoConfig.hipPressureSeconds); Serial.println("s                           ║");
+  Serial.print("║ Pressure Threshold: "); Serial.print(autoConfig.highPressureThreshold, 1); Serial.println(" kg               ║");
+  Serial.print("║ Balance Threshold: "); Serial.print(autoConfig.balanceThreshold, 1); Serial.println(" kg                ║");
+  
+  Serial.println("║ ━━━━━━━━━ ENHANCED PRESETS ━━━━━━━━━━━━━━━━━   ║");
+  Serial.println("║ ✅ FLAT:       (0,5,5) - Default/ราบเรียง  ║");
+  Serial.println("║ 📖 SIT:        (7,5,2) - นั่งอ่านหนังสือ   ║");
+  Serial.println("║ 😴 SLEEP:      (2,5,1) - นอนพักผ่อน        ║");
+  Serial.println("║ ⬅️ LEFT_SIDE:  (0,1,5) - ตะแคงซ้าย        ║");
+  Serial.println("║ ➡️ RIGHT_SIDE: (0,9,5) - ตะแคงขวา         ║");
+  
+  Serial.println("╚═══════════════════════════════════════════════╝");
+}
+
+void printEnhancedHelp() {
+  Serial.println(); Serial.println("╔═══════ ENHANCED AVAILABLE COMMANDS ═══════════╗");
+  Serial.println("║ t             - Tare all Load Cells             ║");
+  Serial.println("║ r             - Calibration menu                ║");
+  Serial.println("║ i             - Show Enhanced Load Cell info    ║");
+  Serial.println("║ h             - Show this help                  ║");
+  Serial.println("║                                                  ║");
+  Serial.println("║ auto on       - Enable Enhanced Auto Mode       ║");
+  Serial.println("║ auto off      - Disable Enhanced Auto Mode      ║");
+  Serial.println("║ demo start    - Start Enhanced Demo Mode        ║");
+  Serial.println("║ demo stop     - Stop Enhanced Demo Mode         ║");
+  Serial.println("║                                                  ║");
+  Serial.println("║ status, ?     - Show enhanced system status     ║");
+  Serial.println("║ config        - Show auto configuration         ║");
+  Serial.println("║ arduino       - Test Arduino connection         ║");
+  Serial.println("║ reconnect     - Force reconnect Arduino         ║");
+  Serial.println("║ test          - Test dashboard connection       ║");
+  Serial.println("║                                                  ║");
+  Serial.println("║ move x,y,z    - Move bed (e.g. move 0,5,5)      ║");
+  Serial.println("║ preset <name> - Use preset position             ║");
+  Serial.println("║   Available: FLAT, SIT, SLEEP, LEFT_SIDE, RIGHT ║");
+  Serial.println("║                                                  ║");
+  Serial.println("║ 🆕 Enhanced Features:                           ║");
+  Serial.println("║   - Individual pressure point monitoring        ║");
+  Serial.println("║   - Simple time-based triggers (วินาที)        ║");
+  Serial.println("║   - Side tilt correction for pressure relief    ║");
+  Serial.println("║   - New LEFT_SIDE & RIGHT_SIDE presets          ║");
+  Serial.println("║   - Configurable timing and thresholds          ║");
+  Serial.println("║                                                  ║");
+  Serial.println("║ 🤖 Enhanced Auto Logic:                         ║");
+  Serial.println("║   - หลังซ้ายแรงกด -> ตะแคงขวา (side=9)        ║");
+  Serial.println("║   - หลังขวาแรงกด -> ตะแคงซ้าย (side=1)        ║");
+  Serial.println("║   - สะโพกแรงกด -> ยกขา (leg+2)                ║");
+  Serial.println("║   - ไม่สมดุล -> เอียงไปฝั่งที่เบากว่า           ║");
+  Serial.println("║                                                  ║");
+  Serial.println("║ ⏱️ Default Timing:                              ║");
+  Serial.println("║   - แรงกดหลัง: 8 วินาที                       ║");
+  Serial.println("║   - ความไม่สมดุล: 12 วินาที                   ║");
+  Serial.println("║   - แรงกดสะโพก: 6 วินาที                      ║");
+  Serial.println("║                                                  ║");
+  Serial.println("║ 🎭 Enhanced Demo Scenarios:                     ║");
+  Serial.println("║   - หลังซ้ายแรงกดสูง -> AUTO ตะแคงขวา (side=9) ║");
+  Serial.println("║   - ความไม่สมดุล -> AUTO ปรับสมดุล            ║");
+  Serial.println("║   - สะโพกแรงกดสูง -> AUTO ยกขา               ║");
+  Serial.println("╚═════════════════════════════════════════════════╝");
+}
